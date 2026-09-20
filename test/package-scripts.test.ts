@@ -112,6 +112,28 @@ test("native lifeline packaging is explicit and checks the assembled manifest", 
   assert.doesNotMatch(JSON.stringify(pkg.scripts ?? {}), /postinstall|install.*build:native/);
 });
 
+test("native lifeline matrices use current macOS runner labels", () => {
+  const ciWorkflow = readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "ci.yml"),
+    "utf8",
+  );
+  const releaseWorkflow = readFileSync(
+    path.join(process.cwd(), ".github", "workflows", "release.yml"),
+    "utf8",
+  );
+  for (const workflow of [ciWorkflow, releaseWorkflow]) {
+    assert.match(workflow, /target: darwin-arm64\s+runner: macos-15/);
+    assert.match(workflow, /target: darwin-x64\s+runner: macos-15-intel/);
+    assert.doesNotMatch(workflow, /runner: macos-(?:13|14)\b/);
+    assert.match(workflow, /otool -l/);
+    assert.match(workflow, /test "\$minos" = "11\.0"/);
+  }
+  assert.match(
+    ciWorkflow,
+    /pnpm run build:test && node --test --test-concurrency=1 dist-test\/test\/lifeline\.test\.js/,
+  );
+});
+
 test("documentation lint rejects unterminated TOML configuration without hanging", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "acpx-doclint-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
