@@ -9,7 +9,7 @@
  */
 
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
@@ -642,3 +642,147 @@ describe("queue owner lifecycle — bridge process death on SIGTERM", () => {
     });
   });
 });
+
+describe("queue owner lifecycle — abrupt owner death", () => {
+  it("reaps the armed bridge process group when the queue owner receives SIGKILL", async () => {
+    if (process.platform !== "darwin" && process.platform !== "linux") {
+      return;
+    }
+
+    await withTempHome("acpx-lifecycle-lifeline-sigkill-", async (homeDir) => {
+      const cwd = path.join(homeDir, "workspace");
+      const bridgePidFile = path.join(homeDir, "bridge.pid");
+      const grandchildPidFile = path.join(homeDir, "grandchild.pid");
+      const promptMarker = path.join(homeDir, "prompt.started");
+      await fs.mkdir(cwd, { recursive: true });
+
+      const record = makeSessionRecord({
+        acpxRecordId: "lifeline-sigkill",
+        acpSessionId: "lifeline-sigkill-session",
+        agentCommand: [
+          "node",
+          JSON.stringify(MOCK_AGENT_PATH),
+          "--pid-file",
+          JSON.stringify(bridgePidFile),
+          "--grandchild-pid-file",
+          JSON.stringify(grandchildPidFile),
+          "--grandchild-ignore-sigterm",
+          "--prompt-start-marker",
+          JSON.stringify(promptMarker),
+        ].join(" "),
+        cwd,
+      });
+      await writeSessionRecordFile(homeDir, record);
+
+      const socketPath = queueSocketPath(record.acpxRecordId, homeDir);
+      const payload = JSON.stringify({
+        sessionId: record.acpxRecordId,
+        permissionMode: "approve-reads",
+      });
+      const owner = spawn(process.execPath, [CLI_PATH, "__queue-owner"], {
+        env: { ...process.env, HOME: homeDir },
+        stdio: ["pipe", "ignore", "pipe"],
+      });
+      owner.stdin.end(payload);
+      const stderrChunks: Buffer[] = [];
+      owner.stderr?.on("data", (chunk: Buffer) => stderrChunks.push(chunk));
+      let queueSocket: net.Socket | undefined;
+      let bridgePid: number | undefined;
+      let grandchildPid: number | undefined;
+      let lifelinePid: number | undefined;
+
+      try {
+        await waitUntil(() => fileExists(socketPath));
+        queueSocket = await connectQueueSocket(socketPath);
+        queueSocket.write(
+          `${JSON.stringify({
+            type: "submit_prompt",
+            requestId: "req-lifeline-sigkill",
+            message: "sleep 10000",
+            permissionMode: "approve-reads",
+            waitForCompletion: true,
+          })}\n`,
+        );
+
+        const lines = readline.createInterface({ input: queueSocket });
+        const iterator = lines[Symbol.asyncIterator]();
+        const accepted = await waitForQueueMessage(
+          iterator,
+          (message) => message.type === "accepted",
+        );
+        assert.equal(accepted.type, "accepted");
+
+        await waitUntil(() => fileExists(promptMarker), 8_000);
+        bridgePid = await waitForBridgePid(bridgePidFile);
+        grandchildPid = await waitForBridgePid(grandchildPidFile);
+        const activeBridgePid = bridgePid;
+        await waitUntil(async () => {
+          lifelinePid = findLifelinePid(activeBridgePid);
+          return lifelinePid !== undefined;
+        });
+        assert(lifelinePid, "lifeline must be observable before killing its owner");
+        const activeLifelinePid = lifelinePid;
+        assert.equal(isProcessAlive(activeBridgePid), true);
+        assert.equal(isProcessAlive(grandchildPid), true);
+        assert.equal(isProcessAlive(activeLifelinePid), true);
+
+        owner.kill("SIGKILL");
+        const ownerExit = await waitForProcessExit(owner, 5_000);
+        assert.equal(ownerExit.signal, "SIGKILL");
+        await waitUntil(
+          async () =>
+            !isProcessAlive(activeBridgePid) &&
+            !isProcessAlive(grandchildPid) &&
+            !isProcessAlive(activeLifelinePid),
+          5_000,
+        );
+        lines.close();
+      } catch (error) {
+        const stderr = Buffer.concat(stderrChunks).toString("utf8");
+        throw new Error(`abrupt-owner lifeline test failed: ${stderr}`, { cause: error });
+      } finally {
+        queueSocket?.destroy();
+        if (owner.exitCode === null && owner.signalCode === null) {
+          owner.kill("SIGKILL");
+        }
+        killProcessGroupForTest(bridgePid);
+        killProcessForTest(grandchildPid);
+        killProcessForTest(lifelinePid);
+      }
+    });
+  });
+});
+
+function findLifelinePid(bridgePid: number): number | undefined {
+  const processList = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf8" });
+  const expectedSuffix = `/dist/native/lifeline-${process.platform}-${process.arch} ${bridgePid}`;
+  for (const line of processList.split("\n")) {
+    const match = /^\s*(\d+)\s+(.+)$/.exec(line);
+    if (match?.[2].endsWith(expectedSuffix)) {
+      return Number(match[1]);
+    }
+  }
+  return undefined;
+}
+
+function killProcessGroupForTest(pgid: number | undefined): void {
+  if (!pgid) {
+    return;
+  }
+  try {
+    process.kill(-pgid, "SIGKILL");
+  } catch {
+    // Best-effort cleanup after a failed assertion.
+  }
+}
+
+function killProcessForTest(pid: number | undefined): void {
+  if (!pid || !isProcessAlive(pid)) {
+    return;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Best-effort cleanup after a failed assertion.
+  }
+}

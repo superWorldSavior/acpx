@@ -101,6 +101,17 @@ test("test scripts build packaged output before running package-bin smoke tests"
   assert.match(pkg.scripts?.["test:coverage"] ?? "", /^pnpm run build && pnpm run build:test && /);
 });
 
+test("native lifeline packaging is explicit and checks the assembled manifest", () => {
+  const pkg = readPackageJson();
+  assert.match(pkg.scripts?.["build:native"] ?? "", /build-native-lifeline\.mjs/);
+  assert.match(pkg.scripts?.["build:native:assemble"] ?? "", /--assemble/);
+  assert.match(pkg.scripts?.["build:native:check"] ?? "", /--check/);
+  assert.match(pkg.scripts?.prepack ?? "", /build:native:check/);
+  assert.doesNotMatch(pkg.scripts?.prepack ?? "", /--clean/);
+  assert.match(pkg.scripts?.prepare ?? "", /^husky && pnpm run build:native$/);
+  assert.doesNotMatch(JSON.stringify(pkg.scripts ?? {}), /postinstall|install.*build:native/);
+});
+
 test("documentation lint rejects unterminated TOML configuration without hanging", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "acpx-doclint-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));

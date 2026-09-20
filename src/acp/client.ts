@@ -115,6 +115,17 @@ import { resolveClientCapabilities, resolveClientInfo } from "./client-protocol.
 import { codexPermissionNotice, preferCodexPermissionRefusal } from "./codex-compat.js";
 import { extractAcpError } from "./error-shapes.js";
 import {
+  hasLiveProcessGroup,
+  observeLifelineWatchdogExit,
+  reapSpawnedProcessGroup,
+  releaseLifelineWatchdog,
+  resolvePackagedLifelineHelper,
+  startLifelineWatchdog,
+  supportsProcessGroupLifeline,
+  waitForChildAndProcessGroupExit,
+  type LifelineWatchdog,
+} from "./lifeline.js";
+import {
   modelStateFromConfigOptions,
   modelStateFromSessionResponse,
   RequestedModelUnsupportedError,
@@ -409,6 +420,8 @@ export class AcpClient {
   private agent?: ChildProcessByStdio<Writable, Readable, Readable>;
   private readonly agentDescendants = new WeakMap<ChildProcess, ProcessDescendants>();
   private readonly agentCleanups = new WeakMap<ChildProcess, Promise<void>>();
+  private readonly agentLifelines = new WeakMap<ChildProcess, LifelineWatchdog>();
+  private readonly agentProcessGroups = new WeakSet<ChildProcess>();
   private initResult?: InitializeResponse;
   private loadedSessionId?: string;
   private eventHandlers: Pick<
@@ -643,6 +656,15 @@ export class AcpClient {
     this.logAgentLaunch(launch);
     await this.ensureLaunchSupport(launch);
     const { child, process: startedProcess } = await this.spawnAgentProcess(launch);
+    if (this.lifelineAdoptionFailed(child)) {
+      await this.terminateAgentProcess(child);
+      const spawnError = new AgentSpawnError(
+        this.options.agentCommand,
+        new Error("lifeline exited before agent launch was adopted"),
+      );
+      this.notifyProcessSpawnFailure(startedProcess, spawnError);
+      throw spawnError;
+    }
     if (this.closeEpoch === epoch) {
       this.agent = child;
       this.closing = false;
@@ -796,39 +818,146 @@ export class AcpClient {
     });
     await this.options.processLifecycle?.onBeforeSpawn?.(launch);
 
-    let spawnedChild: ChildProcessByStdio<Writable, Readable, Readable>;
+    const lifelineHelper = this.resolveRequiredLifelineHelper(launch);
+    const useLifeline = lifelineHelper !== undefined;
+
+    let spawnedChild: ChildProcessByStdio<Writable, Readable, Readable> | undefined;
     try {
       spawnedChild = spawn(spawnCommand.command, spawnCommand.args, {
         ...plan.spawnOptions,
+        detached: useLifeline,
         windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
       });
       await waitForSpawn(spawnedChild);
+      return await this.prepareSpawnedAgent(spawnedChild, lifelineHelper, launch);
     } catch (error) {
+      await this.cleanupFailedAgentSpawn(spawnedChild, useLifeline);
       const spawnError = new AgentSpawnError(this.options.agentCommand, error);
       this.notifyProcessSpawnFailure(launch, spawnError);
       throw spawnError;
     }
+  }
 
+  private resolveRequiredLifelineHelper(launch: AcpProcessLaunch): string | undefined {
+    if (!supportsProcessGroupLifeline()) {
+      return undefined;
+    }
+    const helper = resolvePackagedLifelineHelper();
+    if (helper) {
+      return helper;
+    }
+    const spawnError = new AgentSpawnError(
+      this.options.agentCommand,
+      new Error("trusted packaged lifeline helper is unavailable"),
+    );
+    this.notifyProcessSpawnFailure(launch, spawnError);
+    throw spawnError;
+  }
+
+  private async prepareSpawnedAgent(
+    spawnedChild: ChildProcessByStdio<Writable, Readable, Readable>,
+    lifelineHelper: string | undefined,
+    launch: AcpProcessLaunch,
+  ): Promise<{
+    child: ChildProcessByStdio<Writable, Readable, Readable>;
+    process: AcpProcessStarted;
+  }> {
     const child = requireAgentStdio(spawnedChild);
-    this.agentDescendants.set(child, new ProcessDescendants(child));
     const pid = child.pid;
     if (pid === undefined) {
-      const spawnError = new AgentSpawnError(
-        this.options.agentCommand,
-        new Error("spawned agent process did not expose a PID"),
-      );
-      this.notifyProcessSpawnFailure(launch, spawnError);
-      await this.terminateAgentProcess(child);
-      throw spawnError;
+      throw new Error("spawned agent process did not expose a PID");
     }
+    if (lifelineHelper) {
+      await this.armLifeline(child, lifelineHelper, pid);
+    }
+    this.agentDescendants.set(child, new ProcessDescendants(child));
     return {
       child,
-      process: Object.freeze({
-        ...launch,
-        pid,
-        startedAt: isoNow(),
-      }),
+      process: Object.freeze({ ...launch, pid, startedAt: isoNow() }),
     };
+  }
+
+  private async armLifeline(
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    helper: string,
+    pid: number,
+  ): Promise<void> {
+    // The bridge has to exist before the current watchdog can target its process group.
+    // An owner killed in this short spawn-to-ARMED interval can still leave the bridge
+    // behind. Closing that race requires a helper-first launcher and is intentionally
+    // outside this package-contained watcher design.
+    const watchdog = await startLifelineWatchdog(helper, pid);
+    this.agentProcessGroups.add(child);
+    this.agentLifelines.set(child, watchdog);
+    if (!this.observeLifelineWatchdog(watchdog, child)) {
+      this.agentLifelines.delete(child);
+      this.agentProcessGroups.delete(child);
+      throw new Error("lifeline exited before adoption");
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (
+      this.agentLifelines.get(child) !== watchdog ||
+      watchdog.exitCode !== null ||
+      watchdog.signalCode !== null
+    ) {
+      this.agentLifelines.delete(child);
+      this.agentProcessGroups.delete(child);
+      throw new Error("lifeline exited before agent launch was adopted");
+    }
+  }
+
+  private async cleanupFailedAgentSpawn(
+    child: ChildProcessByStdio<Writable, Readable, Readable> | undefined,
+    processGroup: boolean,
+  ): Promise<void> {
+    if (!child) {
+      return;
+    }
+    if (processGroup && child.pid !== undefined) {
+      await reapSpawnedProcessGroup(child, AGENT_CLOSE_TERM_GRACE_MS, AGENT_CLOSE_KILL_GRACE_MS);
+      return;
+    }
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // The failed child may already have exited.
+    }
+    this.detachAgentHandles(child, isChildProcessRunning(child));
+  }
+
+  private observeLifelineWatchdog(
+    watchdog: LifelineWatchdog,
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+  ): boolean {
+    const onExit = (): void => {
+      if (this.agentLifelines.get(child) !== watchdog) {
+        return;
+      }
+      this.agentLifelines.delete(child);
+      if (this.agent !== child) {
+        return;
+      }
+      if (!child.pid || !hasLiveProcessGroup(child.pid)) {
+        return;
+      }
+      this.log(
+        "lifeline exited while the agent process group was alive; forcing observed-agent cleanup",
+      );
+      void this.terminateAgentProcess(child).finally(() => {
+        if (this.agent === child) {
+          this.closeConnection();
+        }
+      });
+    };
+    return observeLifelineWatchdogExit(watchdog, onExit);
+  }
+
+  private lifelineAdoptionFailed(child: ChildProcess): boolean {
+    if (!this.agentProcessGroups.has(child)) {
+      return false;
+    }
+    const watchdog = this.agentLifelines.get(child);
+    return watchdog === undefined || watchdog.exitCode !== null || watchdog.signalCode !== null;
   }
 
   private async admitAndObserveSpawnedProcess(
@@ -1673,25 +1802,101 @@ export class AcpClient {
         await descendants.capture(Math.max(1, deadline - Date.now()));
       }
       this.endAgentStdin(child);
-      await waitForChildExit(
-        child,
-        Math.min(stdinCloseGraceMs, Math.max(0, deadline - Date.now())),
-      );
-      const exited = await this.signalAgentAndDescendants(
-        child,
-        "SIGTERM",
-        AGENT_CLOSE_TERM_GRACE_MS,
-        deadline,
-      );
-      if (!exited) {
-        this.log("agent processes did not exit after SIGTERM; forcing SIGKILL");
-        await this.signalAgentAndDescendants(child, "SIGKILL", AGENT_CLOSE_KILL_GRACE_MS, deadline);
+      const stdinGrace = Math.min(stdinCloseGraceMs, Math.max(0, deadline - Date.now()));
+      if (this.agentProcessGroups.has(child) && child.pid !== undefined) {
+        const reaped = await this.cleanupManagedAgentProcessGroup(
+          child,
+          descendants,
+          stdinGrace,
+          deadline,
+        );
+        this.finishLifelineCleanup(child, reaped);
+      } else {
+        await this.cleanupHistoricalAgentProcesses(child, stdinGrace, deadline);
       }
     } finally {
       descendants?.retire();
       // Stdio must not keep acpx alive after teardown, even if an OS query failed.
       this.detachAgentHandles(child, isChildProcessRunning(child));
     }
+  }
+
+  private async cleanupManagedAgentProcessGroup(
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    descendants: ProcessDescendants | undefined,
+    stdinGrace: number,
+    deadline: number,
+  ): Promise<boolean> {
+    // Prioritize witnessed descendants outside the process group. The watchdog can
+    // still reap the group if this bounded cooperative cleanup exhausts its budget,
+    // while no equivalent fallback exists for a descendant that called setsid().
+    const descendantsReaped = await this.cleanupKnownDescendants(descendants, deadline);
+    let groupReaped = await waitForChildAndProcessGroupExit(
+      child,
+      child.pid!,
+      Math.min(stdinGrace, Math.max(0, deadline - Date.now())),
+    );
+    if (!groupReaped) {
+      groupReaped = await reapSpawnedProcessGroup(
+        child,
+        Math.min(AGENT_CLOSE_TERM_GRACE_MS, Math.max(0, deadline - Date.now())),
+        Math.min(AGENT_CLOSE_KILL_GRACE_MS, Math.max(0, deadline - Date.now())),
+      );
+    }
+    return groupReaped && descendantsReaped;
+  }
+
+  private async cleanupKnownDescendants(
+    descendants: ProcessDescendants | undefined,
+    deadline: number,
+  ): Promise<boolean> {
+    if (!descendants || Date.now() >= deadline) {
+      return !descendants;
+    }
+    await descendants.signal("SIGTERM", deadline - Date.now());
+    const exited = await descendants.waitForExit(
+      Math.min(AGENT_CLOSE_TERM_GRACE_MS, Math.max(0, deadline - Date.now())),
+    );
+    if (exited || Date.now() >= deadline) {
+      return exited;
+    }
+    await descendants.signal("SIGKILL", deadline - Date.now());
+    return await descendants.waitForExit(
+      Math.min(AGENT_CLOSE_KILL_GRACE_MS, Math.max(0, deadline - Date.now())),
+    );
+  }
+
+  private finishLifelineCleanup(
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    reaped: boolean,
+  ): void {
+    if (!reaped) {
+      this.log("agent process group cleanup is still unproved; triggering native fallback");
+      this.agentLifelines.get(child)?.stdin.destroy();
+      return;
+    }
+    const watchdog = this.agentLifelines.get(child);
+    this.agentLifelines.delete(child);
+    releaseLifelineWatchdog(watchdog);
+  }
+
+  private async cleanupHistoricalAgentProcesses(
+    child: ChildProcessByStdio<Writable, Readable, Readable>,
+    stdinGrace: number,
+    deadline: number,
+  ): Promise<void> {
+    await waitForChildExit(child, stdinGrace);
+    const exited = await this.signalAgentAndDescendants(
+      child,
+      "SIGTERM",
+      AGENT_CLOSE_TERM_GRACE_MS,
+      deadline,
+    );
+    if (exited) {
+      return;
+    }
+    this.log("agent processes did not exit after SIGTERM; forcing SIGKILL");
+    await this.signalAgentAndDescendants(child, "SIGKILL", AGENT_CLOSE_KILL_GRACE_MS, deadline);
   }
 
   private endAgentStdin(child: ChildProcessByStdio<Writable, Readable, Readable>): void {
