@@ -1,3 +1,11 @@
+> [!NOTE]
+> **Erwan Lee Pesle's contribution fork of [openclaw/acpx](https://github.com/openclaw/acpx).**
+> This fork contains contribution work and preserved branch history.
+> Historical Casys branches are preserved under
+> [`casys-migration-20261005`](https://github.com/superWorldSavior/acpx/branches/all?query=casys-migration-20261005),
+> including [the former Casys `main`](https://github.com/superWorldSavior/acpx/tree/casys-migration-20261005/main).
+> Upstream releases and project documentation: [openclaw/acpx](https://github.com/openclaw/acpx).
+
 # acpx 🤝 — Agents talking to agents, minus the terminal séance
 
 <p align="center">
